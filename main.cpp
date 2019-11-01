@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <netinet/in.h>
 #include <linux/types.h>
@@ -7,6 +8,11 @@
 #include <errno.h>
 
 #include <libnetfilter_queue/libnetfilter_queue.h>
+
+#include "http_util.h"
+#include "packet.h"
+
+char* bad_host;
 
 void dump(unsigned char* buf, int size) {
 	int i;
@@ -18,7 +24,7 @@ void dump(unsigned char* buf, int size) {
 }
 
 /* returns packet id */
-static u_int32_t print_pkt (struct nfq_data *tb)
+static u_int32_t print_pkt (struct nfq_data *tb, bool* blocked)
 {
 	int id = 0;
 	struct nfqnl_msg_packet_hdr *ph;
@@ -64,7 +70,28 @@ static u_int32_t print_pkt (struct nfq_data *tb)
 		printf("physoutdev=%u ", ifi);
 
 	ret = nfq_get_payload(tb, &data);
-	dump(data, ret);
+	
+	IP_header* ip = (IP_header*)data;
+	TCP_header* tcp = (TCP_header*)((uint8_t*)ip + (ip->header_len << 2));
+
+	uint8_t* tcp_data = (uint8_t*)((uint8_t*)tcp + (tcp -> hlen << 2));
+
+	if(is_http(tcp_data)) {
+		char* host;
+		int host_len;
+		get_param(tcp_data, "Host", &host, &host_len);
+		if(!memcmp(bad_host, host, host_len)){
+			printf("blocked\n\n");
+			*blocked = true;
+		}
+		else{
+			*blocked = false;
+		}
+	}
+	else {
+		*blocked = false;
+	}
+
 	if (ret >= 0)
 		printf("payload_len=%d ", ret);
 
@@ -77,9 +104,16 @@ static u_int32_t print_pkt (struct nfq_data *tb)
 static int cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 	      struct nfq_data *nfa, void *data)
 {
-	u_int32_t id = print_pkt(nfa);
+	bool blocked;
+	u_int32_t id = print_pkt(nfa, &blocked);
 	printf("entering callback\n");
-	return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+	if(blocked) return nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
+	else return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+}
+
+void usage(){
+	printf("syntax: netfilter_block <host>\n");
+	printf("sample: netfilter_block test.gilgil.net\n");
 }
 
 int main(int argc, char **argv)
@@ -90,6 +124,13 @@ int main(int argc, char **argv)
 	int fd;
 	int rv;
 	char buf[4096] __attribute__ ((aligned));
+
+	if (argc < 2){
+		usage();
+		return -1;
+	}
+
+	bad_host = argv[1];
 
 	printf("opening library handle\n");
 	h = nfq_open();
